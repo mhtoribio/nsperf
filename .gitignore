@@ -1,0 +1,21 @@
+# Go
+/bin/
+/dist/
+/coverage.out
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local experiment output
+/logs/
+/*.send.csv
+/*.recv.csv
+/.codex
+
+# Nix
+/result
+/result-*
+.direnv/
