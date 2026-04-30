@@ -18,6 +18,7 @@ Useful development checks:
 ```sh
 go test ./...
 golangci-lint run ./...
+pytest tools
 python3 -B -m py_compile tools/analyze.py
 ```
 
@@ -49,6 +50,7 @@ Analyze the logs after the run:
 ```sh
 python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv
 python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --json
+python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --interval 1
 ```
 
 For network namespaces, run the same commands through your namespace tooling, for example `ip netns exec <ns> ./bin/nsperf ...`.
@@ -177,6 +179,21 @@ python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --j
 ```
 
 JSON output uses numeric nanosecond fields for timing stats and numeric `*_bps` fields for rates. Missing metrics are `null`.
+
+Use `--interval SECONDS` for fixed-width interval reports. Common values are `1` for one-second reporting, `0.5` for 500 ms reporting, or `5` for a coarser five-second view:
+
+```sh
+python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --interval 1
+python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --interval 0.5
+python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --interval 5 --json
+```
+
+Interval reporting keeps boundary effects explicit:
+
+- send-side generation, local failures, skipped slots, sender timing, packet loss, and latency are grouped by the packet's send interval;
+- receive-side throughput, duplicate counts, receive decode errors, reordering, and receive spacing are grouped by the packet's receive interval.
+
+This means a packet sent in interval `0.0-1.0s` and received in `1.0-2.0s` contributes to latency and delivery for the send interval, while its received bytes contribute to throughput for the receive interval.
 
 ## Development Shell
 

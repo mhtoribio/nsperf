@@ -9,12 +9,14 @@ import json
 import math
 import sys
 from collections import Counter
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 
 FNV64_OFFSET = 0xCBF29CE484222325
 FNV64_PRIME = 0x100000001B3
+NS_PER_SECOND = 1_000_000_000
 
 
 def hash_id(value: str) -> int:
@@ -37,6 +39,20 @@ def int_field(row: dict[str, str], name: str, default: int = 0) -> int:
     return int(value)
 
 
+def parse_interval_ns(value: str) -> int:
+    try:
+        seconds = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"invalid interval {value!r}") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("--interval must be greater than 0")
+
+    interval_ns = (seconds * NS_PER_SECOND).to_integral_value(rounding=ROUND_HALF_UP)
+    if interval_ns <= 0:
+        raise argparse.ArgumentTypeError("--interval is too small")
+    return int(interval_ns)
+
+
 def send_status(row: dict[str, str]) -> str:
     status = row.get("status", "")
     if status:
@@ -51,7 +67,7 @@ def send_status(row: dict[str, str]) -> str:
 def bitrate_value(bits: int, start_ns: int | None, end_ns: int | None) -> float | None:
     if start_ns is None or end_ns is None or end_ns <= start_ns:
         return None
-    return bits / ((end_ns - start_ns) / 1_000_000_000)
+    return bits / ((end_ns - start_ns) / NS_PER_SECOND)
 
 
 def format_ns(value: int) -> str:
@@ -127,6 +143,40 @@ def rfc3550_jitter(values: list[int]) -> int | None:
     return round(jitter)
 
 
+def window_index(timestamp_ns: int, base_ns: int, interval_ns: int) -> int:
+    if timestamp_ns < base_ns:
+        return 0
+    return (timestamp_ns - base_ns) // interval_ns
+
+
+def send_window_timestamp(row: dict[str, str]) -> int:
+    if send_status(row) == "skipped":
+        return int_field(row, "scheduled_ns")
+    if row.get("send_attempt_ns"):
+        return int_field(row, "send_attempt_ns")
+    return int_field(row, "scheduled_ns")
+
+
+def reorder_count(rows: list[dict[str, str]]) -> int:
+    reorders = 0
+    max_seen = -1
+    for row in rows:
+        seq = int_field(row, "seq")
+        if seq < max_seen:
+            reorders += 1
+        max_seen = max(max_seen, seq)
+    return reorders
+
+
+def bucket_rows(rows: list[Any], base_ns: int, interval_ns: int, interval_count: int, timestamp_fn: Any) -> list[list[Any]]:
+    buckets: list[list[Any]] = [[] for _ in range(interval_count)]
+    for row in rows:
+        idx = window_index(timestamp_fn(row), base_ns, interval_ns)
+        if 0 <= idx < interval_count:
+            buckets[idx].append(row)
+    return buckets
+
+
 def infer_ids(send_rows: list[dict[str, str]], run_id: str | None, flow_id: str | None) -> tuple[str | None, str | None]:
     if not send_rows:
         return run_id, flow_id
@@ -135,6 +185,151 @@ def infer_ids(send_rows: list[dict[str, str]], run_id: str | None, flow_id: str 
     if flow_id is None:
         flow_id = send_rows[0].get("flow_id") or None
     return run_id, flow_id
+
+
+def build_intervals(
+    interval_ns: int,
+    send_rows: list[dict[str, str]],
+    skipped_rows: list[dict[str, str]],
+    attempt_rows: list[dict[str, str]],
+    sent_ok: list[dict[str, str]],
+    decode_error_rows: list[dict[str, str]],
+    valid_recv: list[dict[str, str]],
+    matched_receives: list[dict[str, int]],
+    earliest_by_seq: dict[int, dict[str, int]],
+) -> dict[str, Any] | None:
+    timestamps = [send_window_timestamp(row) for row in send_rows]
+    timestamps.extend(int_field(row, "recv_ns") for row in valid_recv)
+    timestamps.extend(int_field(row, "recv_ns") for row in decode_error_rows)
+    if not timestamps:
+        return None
+
+    base_ns = min(timestamps)
+    max_ns = max(timestamps)
+    interval_count = window_index(max_ns, base_ns, interval_ns) + 1
+    reorder_counts = receive_reorder_counts_by_window(valid_recv, base_ns, interval_ns, interval_count)
+    skipped_by_window = bucket_rows(
+        skipped_rows, base_ns, interval_ns, interval_count, lambda row: int_field(row, "scheduled_ns")
+    )
+    attempts_by_window = bucket_rows(
+        attempt_rows, base_ns, interval_ns, interval_count, send_window_timestamp
+    )
+    sent_ok_by_window = bucket_rows(
+        sent_ok, base_ns, interval_ns, interval_count, send_window_timestamp
+    )
+    recv_by_window = bucket_rows(
+        valid_recv, base_ns, interval_ns, interval_count, lambda row: int_field(row, "recv_ns")
+    )
+    decode_errors_by_window = bucket_rows(
+        decode_error_rows, base_ns, interval_ns, interval_count, lambda row: int_field(row, "recv_ns")
+    )
+    matched_recv_by_recv_window = bucket_rows(
+        matched_receives, base_ns, interval_ns, interval_count, lambda row: row["recv_ns"]
+    )
+    delivery_by_send_window = bucket_rows(
+        list(earliest_by_seq.values()), base_ns, interval_ns, interval_count, lambda row: row["send_attempt_ns"]
+    )
+
+    intervals = []
+    for index in range(interval_count):
+        start_ns = base_ns + index * interval_ns
+        end_ns = start_ns + interval_ns
+
+        skipped_in_window = skipped_by_window[index]
+        attempts_in_window = attempts_by_window[index]
+        failures_in_window = [
+            row for row in attempts_in_window if row.get("send_error") or send_status(row) == "send_error"
+        ]
+        sent_ok_in_window = sent_ok_by_window[index]
+        sent_ok_seq_in_window = {int_field(row, "seq") for row in sent_ok_in_window}
+        delivery_rows = delivery_by_send_window[index]
+        delivery_latencies = [
+            row["latency_ns"] for row in sorted(delivery_rows, key=lambda delivery: delivery["seq"])
+        ]
+        send_late = [int_field(row, "late_by_ns") for row in attempts_in_window if row.get("late_by_ns")]
+        sender_errors_by_seq = [
+            int_field(row, "late_by_ns")
+            for row in sorted(attempts_in_window, key=lambda send_row: int_field(send_row, "seq"))
+            if row.get("late_by_ns")
+        ]
+        skipped_late = [int_field(row, "late_by_ns") for row in skipped_in_window if row.get("late_by_ns")]
+        sent_bits = sum(int_field(row, "bytes") for row in sent_ok_in_window) * 8
+
+        recv_in_window = recv_by_window[index]
+        decode_errors_in_window = decode_errors_by_window[index]
+        recv_counts = Counter(int_field(row, "seq") for row in recv_in_window)
+        recv_duplicates = sum(count - 1 for count in recv_counts.values() if count > 1)
+        recv_bits = sum(int_field(row, "bytes") for row in recv_in_window) * 8
+        matched_recv_in_window = matched_recv_by_recv_window[index]
+        receive_spacing_errors = adjacent_spacing_errors(
+            sorted(matched_recv_in_window, key=lambda recv_row: recv_row["recv_ns"])
+        )
+
+        received_for_send_window = len(delivery_rows)
+        lost_for_send_window = len(sent_ok_seq_in_window) - received_for_send_window
+
+        intervals.append(
+            {
+                "index": index,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "start_s": (start_ns - base_ns) / NS_PER_SECOND,
+                "end_s": (end_ns - base_ns) / NS_PER_SECOND,
+                "duration_ns": interval_ns,
+                "send_window": {
+                    "scheduled_packets_logged": len(attempts_in_window) + len(skipped_in_window),
+                    "send_attempts": len(attempts_in_window),
+                    "local_send_failures": len(failures_in_window),
+                    "skipped_by_generator": len(skipped_in_window),
+                    "generated_bits": sent_bits,
+                    "generated_bps": bitrate_value(sent_bits, start_ns, end_ns),
+                    "sender_timing_error_ns": stats_ns_data(send_late),
+                    "sender_timing_jitter_abs_ns": stats_ns_data(adjacent_abs_deltas(sender_errors_by_seq)),
+                    "skipped_timing_error_ns": stats_ns_data(skipped_late),
+                },
+                "receive_window": {
+                    "received_valid": len(recv_in_window),
+                    "receive_decode_errors": len(decode_errors_in_window),
+                    "received_bits": recv_bits,
+                    "received_bps": bitrate_value(recv_bits, start_ns, end_ns),
+                    "duplicates": recv_duplicates,
+                    "reordered_receives": reorder_counts[index],
+                    "receive_spacing_error_ns": stats_ns_data(receive_spacing_errors),
+                },
+                "delivery_for_send_window": {
+                    "received": received_for_send_window,
+                    "lost_after_successful_send": lost_for_send_window,
+                    "host_local_latency_estimate_ns": stats_ns_data(delivery_latencies),
+                    "host_local_latency_jitter_abs_ns": stats_ns_data(adjacent_abs_deltas(delivery_latencies)),
+                    "host_local_latency_jitter_rfc3550_ns": rfc3550_jitter(delivery_latencies),
+                },
+            }
+        )
+
+    return {
+        "interval_seconds": interval_ns / NS_PER_SECOND,
+        "interval_ns": interval_ns,
+        "base_ns": base_ns,
+        "windows": intervals,
+    }
+
+
+def receive_reorder_counts_by_window(
+    valid_recv: list[dict[str, str]],
+    base_ns: int,
+    interval_ns: int,
+    interval_count: int,
+) -> list[int]:
+    counts = [0] * interval_count
+    max_seen = -1
+    for row in valid_recv:
+        seq = int_field(row, "seq")
+        if seq < max_seen:
+            idx = window_index(int_field(row, "recv_ns"), base_ns, interval_ns)
+            if 0 <= idx < interval_count:
+                counts[idx] += 1
+        max_seen = max(max_seen, seq)
+    return counts
 
 
 def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
@@ -150,8 +345,9 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
     run_hash = hash_id(run_id) if run_id is not None else None
     flow_hash = hash_id(flow_id) if flow_id is not None else None
 
+    decode_error_rows = [row for row in recv_rows if row.get("decode_error")]
     valid_recv = [row for row in recv_rows if not row.get("decode_error")]
-    decode_errors = len(recv_rows) - len(valid_recv)
+    decode_errors = len(decode_error_rows)
     if run_hash is not None:
         valid_recv = [row for row in valid_recv if int_field(row, "run_id_hash", -1) == run_hash]
     if flow_hash is not None:
@@ -169,14 +365,7 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
 
     duplicates = sum(count - 1 for count in recv_counts.values() if count > 1)
     lost = len(sent_unique - recv_unique)
-
-    reorders = 0
-    max_seen = -1
-    for row in valid_recv:
-        seq = int_field(row, "seq")
-        if seq < max_seen:
-            reorders += 1
-        max_seen = max(max_seen, seq)
+    reorders = reorder_count(valid_recv)
 
     send_late = [int_field(row, "late_by_ns") for row in attempt_rows if row.get("late_by_ns")]
     skipped_late = [int_field(row, "late_by_ns") for row in skipped_rows if row.get("late_by_ns")]
@@ -231,7 +420,7 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
     if skipped_rows:
         warnings.append("generator skipped missed send slots; traffic was not fully generated")
 
-    return {
+    result = {
         "schema": "nsperf-analysis-v1",
         "run_id": run_id,
         "flow_id": flow_id,
@@ -268,6 +457,21 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
         "warnings": warnings,
     }
 
+    if args.interval_ns is not None:
+        result["intervals"] = build_intervals(
+            args.interval_ns,
+            send_rows,
+            skipped_rows,
+            attempt_rows,
+            sent_ok,
+            decode_error_rows,
+            valid_recv,
+            matched_receives,
+            earliest_by_seq,
+        )
+
+    return result
+
 
 def print_text(result: dict[str, Any]) -> None:
     counts = result["counts"]
@@ -297,6 +501,52 @@ def print_text(result: dict[str, Any]) -> None:
     for warning in result["warnings"]:
         print(f"warning: {warning}")
 
+    intervals = result.get("intervals")
+    if intervals is not None:
+        print_interval_text(intervals)
+
+
+def print_interval_text(intervals: dict[str, Any] | None) -> None:
+    if intervals is None:
+        print()
+        print("intervals: n/a")
+        return
+
+    print()
+    print(f"intervals: {intervals['interval_seconds']:.9g}s")
+    for item in intervals["windows"]:
+        send = item["send_window"]
+        recv = item["receive_window"]
+        delivery = item["delivery_for_send_window"]
+        print(f"[{item['start_s']:.6f}-{item['end_s']:.6f}s]")
+        print(
+            "  "
+            f"send_attempts={send['send_attempts']} "
+            f"local_send_failures={send['local_send_failures']} "
+            f"skipped_by_generator={send['skipped_by_generator']} "
+            f"received_valid={recv['received_valid']} "
+            f"receive_decode_errors={recv['receive_decode_errors']} "
+            f"lost_after_successful_send={delivery['lost_after_successful_send']} "
+            f"duplicates={recv['duplicates']} "
+            f"reordered_receives={recv['reordered_receives']}"
+        )
+        print(
+            "  "
+            f"generated_bitrate={format_bitrate_value(send['generated_bps'])} "
+            f"received_bitrate={format_bitrate_value(recv['received_bps'])}"
+        )
+        print(f"  sender_timing_error: {format_stats_ns(send['sender_timing_error_ns'])}")
+        print(f"  sender_timing_jitter_abs: {format_stats_ns(send['sender_timing_jitter_abs_ns'])}")
+        print(f"  skipped_timing_error: {format_stats_ns(send['skipped_timing_error_ns'])}")
+        print(f"  host_local_latency_estimate: {format_stats_ns(delivery['host_local_latency_estimate_ns'])}")
+        print(f"  host_local_latency_jitter_abs: {format_stats_ns(delivery['host_local_latency_jitter_abs_ns'])}")
+        print(
+            "  "
+            "host_local_latency_jitter_rfc3550: "
+            f"{format_ns(delivery['host_local_latency_jitter_rfc3550_ns']) if delivery['host_local_latency_jitter_rfc3550_ns'] is not None else 'n/a'}"
+        )
+        print(f"  receive_spacing_error: {format_stats_ns(recv['receive_spacing_error_ns'])}")
+
 
 def format_bitrate_value(value: float | None) -> str:
     if value is None:
@@ -319,6 +569,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--recv", type=Path, required=True, help="server receive CSV")
     parser.add_argument("--run-id", help="run identifier to analyze; inferred from send log by default")
     parser.add_argument("--flow-id", help="flow identifier to analyze; inferred from send log by default")
+    parser.add_argument("--interval", type=parse_interval_ns, dest="interval_ns", metavar="SECONDS", help="emit interval reports using fixed-width windows")
     parser.add_argument("--format", dest="output_format", choices=("text", "json"), default="text", help="output format")
     parser.add_argument("--json", action="store_const", const="json", dest="output_format", help="shortcut for --format json")
     return analyze(parser.parse_args(argv))
