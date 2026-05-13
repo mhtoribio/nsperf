@@ -98,3 +98,25 @@ func TestWriteRecvDecodeErrorLeavesPacketFieldsEmpty(t *testing.T) {
 		t.Fatalf("unexpected recv row: %#v", records[1])
 	}
 }
+
+func TestBufferedWriterFlushesOuterBuffer(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewBufferedWriter(&buf, 4096)
+
+	if w.buf == nil {
+		t.Fatal("NewBufferedWriter did not install an outer buffer")
+	}
+	if w.buf.Size() != 4096 {
+		t.Fatalf("outer buffer size = %d, want 4096", w.buf.Size())
+	}
+	if err := w.WriteSendHeader(); err != nil {
+		t.Fatalf("WriteSendHeader: %v", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if buf.Len() == 0 {
+		t.Fatal("Writer.Flush did not flush the outer buffer")
+	}
+}

@@ -31,3 +31,38 @@ func TestIntervalNS(t *testing.T) {
 		t.Fatalf("IntervalNS = %d, want 960000", got)
 	}
 }
+
+func TestParseByteSize(t *testing.T) {
+	tests := map[string]int{
+		"0":        0,
+		"4096":     4096,
+		"64KiB":    64 * 1024,
+		"100MiB":   100 * 1024 * 1024,
+		"1GiB":     1024 * 1024 * 1024,
+		"100MB":    100 * 1000 * 1000,
+		"1.5MiB":   1536 * 1024,
+		"128 byte": 128,
+	}
+
+	for input, want := range tests {
+		got, err := ParseByteSize(input)
+		if err != nil {
+			t.Fatalf("ParseByteSize(%q): %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("ParseByteSize(%q) = %d, want %d", input, got, want)
+		}
+	}
+}
+
+func TestParseByteSizeRejectsNegative(t *testing.T) {
+	if _, err := ParseByteSize("-1"); err == nil {
+		t.Fatal("ParseByteSize accepted a negative value")
+	}
+}
+
+func TestParseByteSizeRejectsFractionalByte(t *testing.T) {
+	if _, err := ParseByteSize("0.5"); err == nil {
+		t.Fatal("ParseByteSize accepted a fractional byte value")
+	}
+}

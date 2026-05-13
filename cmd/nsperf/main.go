@@ -51,11 +51,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 func runServer(args []string, stderr io.Writer) error {
 	cfg := app.ServerConfig{}
+	csvBufferSize := app.DefaultCSVBufferSize
 	fs := flag.NewFlagSet("nsperf server", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&cfg.Bind, "bind", "0.0.0.0", "UDP bind address")
 	fs.IntVar(&cfg.Port, "port", 5201, "UDP bind port")
 	fs.StringVar(&cfg.Out, "out", "nsperf.recv.csv", "receive CSV log path")
+	fs.StringVar(&csvBufferSize, "csv-buffer-size", csvBufferSize, "file-backed CSV buffer size, e.g. 0, 64KiB, 100MiB")
 	fs.BoolVar(&cfg.Quiet, "quiet", false, "suppress progress logs")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -67,6 +69,12 @@ func runServer(args []string, stderr io.Writer) error {
 		return fmt.Errorf("unexpected server argument %q", fs.Arg(0))
 	}
 
+	parsedCSVBufferSize, err := app.ParseByteSize(csvBufferSize)
+	if err != nil {
+		return fmt.Errorf("parse --csv-buffer-size: %w", err)
+	}
+	cfg.CSVBufferSize = parsedCSVBufferSize
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return app.RunServer(ctx, cfg, stderr)
@@ -76,6 +84,7 @@ func runClient(args []string, stderr io.Writer) error {
 	cfg := app.ClientConfig{}
 	duration := "10s"
 	lateTolerance := "10ms"
+	csvBufferSize := app.DefaultCSVBufferSize
 
 	fs := flag.NewFlagSet("nsperf client", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -90,6 +99,7 @@ func runClient(args []string, stderr io.Writer) error {
 	fs.StringVar(&cfg.Out, "out", "nsperf.send.csv", "send CSV log path")
 	fs.StringVar(&cfg.OverrunPolicy, "overrun-policy", app.OverrunSkipMissed, "overrun policy: skip-missed or send-late")
 	fs.StringVar(&lateTolerance, "late-tolerance", lateTolerance, "generator lateness tolerated by skip-missed before skipping, e.g. 10ms or 0s")
+	fs.StringVar(&csvBufferSize, "csv-buffer-size", csvBufferSize, "file-backed CSV buffer size, e.g. 0, 64KiB, 100MiB")
 	fs.BoolVar(&cfg.Quiet, "quiet", false, "suppress progress logs")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -115,6 +125,12 @@ func runClient(args []string, stderr io.Writer) error {
 		return fmt.Errorf("--late-tolerance must be non-negative")
 	}
 	cfg.LateTolerance = parsedLateTolerance
+
+	parsedCSVBufferSize, err := app.ParseByteSize(csvBufferSize)
+	if err != nil {
+		return fmt.Errorf("parse --csv-buffer-size: %w", err)
+	}
+	cfg.CSVBufferSize = parsedCSVBufferSize
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

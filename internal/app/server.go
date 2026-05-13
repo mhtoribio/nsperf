@@ -14,10 +14,11 @@ import (
 )
 
 type ServerConfig struct {
-	Bind  string
-	Port  int
-	Out   string
-	Quiet bool
+	Bind          string
+	Port          int
+	Out           string
+	CSVBufferSize int
+	Quiet         bool
 }
 
 func RunServer(ctx context.Context, cfg ServerConfig, stderr io.Writer) error {
@@ -30,6 +31,9 @@ func RunServer(ctx context.Context, cfg ServerConfig, stderr io.Writer) error {
 	if cfg.Out == "" {
 		return fmt.Errorf("--out is required")
 	}
+	if cfg.CSVBufferSize < 0 {
+		return fmt.Errorf("--csv-buffer-size must be non-negative")
+	}
 
 	out, err := logio.Create(cfg.Out)
 	if err != nil {
@@ -41,7 +45,7 @@ func RunServer(ctx context.Context, cfg ServerConfig, stderr io.Writer) error {
 		}()
 	}
 
-	logw := logio.NewWriter(out)
+	logw := newLogWriter(out, cfg.CSVBufferSize)
 	if err := logw.WriteRecvHeader(); err != nil {
 		return err
 	}

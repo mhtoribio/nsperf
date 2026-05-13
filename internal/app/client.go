@@ -24,6 +24,7 @@ type ClientConfig struct {
 	RunID         string
 	FlowID        string
 	Out           string
+	CSVBufferSize int
 	OverrunPolicy string
 	LateTolerance time.Duration
 	Quiet         bool
@@ -47,6 +48,9 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	}
 	if cfg.Out == "" {
 		return fmt.Errorf("--out is required")
+	}
+	if cfg.CSVBufferSize < 0 {
+		return fmt.Errorf("--csv-buffer-size must be non-negative")
 	}
 	if cfg.OverrunPolicy == "" {
 		cfg.OverrunPolicy = OverrunSkipMissed
@@ -81,7 +85,7 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 		}()
 	}
 
-	logw := logio.NewWriter(out)
+	logw := newLogWriter(out, cfg.CSVBufferSize)
 	if err := logw.WriteSendHeader(); err != nil {
 		return err
 	}
@@ -112,6 +116,12 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	endNS := startNS + cfg.Duration.Nanoseconds()
 	runHash := packet.HashID(cfg.RunID)
 	flowHash := packet.HashID(cfg.FlowID)
+	datagram := make([]byte, cfg.Length)
+	header := packet.Header{
+		RunIDHash:  runHash,
+		FlowIDHash: flowHash,
+		PayloadLen: uint32(cfg.Length - packet.HeaderLen),
+	}
 
 	if !cfg.Quiet {
 		_, _ = fmt.Fprintf(stderr, "client run_id=%s flow_id=%s dst=%s bitrate=%d length=%d interval_ns=%d late_tolerance_ns=%d start_mono_ns=%d\n",
@@ -119,8 +129,10 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	}
 
 	var attempted, failed, skipped uint64
+	sleeper := monotonicSleeper{}
+	defer sleeper.Stop()
 	for seq, scheduledNS := uint64(0), startNS; scheduledNS < endNS; {
-		if err := sleepUntil(ctx, scheduledNS); err != nil {
+		if err := sleeper.SleepUntil(ctx, scheduledNS); err != nil {
 			return err
 		}
 
@@ -162,14 +174,10 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 		}
 
 		sendAttemptNS := nowNS
-		datagram, err := packet.BuildDatagram(cfg.Length, packet.Header{
-			RunIDHash:     runHash,
-			FlowIDHash:    flowHash,
-			Sequence:      seq,
-			ScheduledNS:   scheduledNS,
-			SendAttemptNS: sendAttemptNS,
-		})
-		if err != nil {
+		header.Sequence = seq
+		header.ScheduledNS = scheduledNS
+		header.SendAttemptNS = sendAttemptNS
+		if err := packet.Encode(datagram, header); err != nil {
 			return err
 		}
 
@@ -238,7 +246,11 @@ func shouldSkipMissedSlot(latenessNS, intervalNS, lateToleranceNS int64) bool {
 	return latenessNS >= intervalNS+lateToleranceNS
 }
 
-func sleepUntil(ctx context.Context, targetNS int64) error {
+type monotonicSleeper struct {
+	timer *time.Timer
+}
+
+func (s *monotonicSleeper) SleepUntil(ctx context.Context, targetNS int64) error {
 	nowNS, err := clock.NowNS()
 	if err != nil {
 		return err
@@ -247,15 +259,43 @@ func sleepUntil(ctx context.Context, targetNS int64) error {
 		return nil
 	}
 
-	timer := time.NewTimer(time.Duration(targetNS - nowNS))
-	defer timer.Stop()
+	delay := time.Duration(targetNS - nowNS)
+	if s.timer == nil {
+		s.timer = time.NewTimer(delay)
+	} else {
+		s.stopTimer()
+		s.timer.Reset(delay)
+	}
 
 	select {
 	case <-ctx.Done():
+		s.stopTimer()
 		return ctx.Err()
-	case <-timer.C:
+	case <-s.timer.C:
 		return nil
 	}
+}
+
+func (s *monotonicSleeper) Stop() {
+	if s.timer != nil {
+		s.stopTimer()
+	}
+}
+
+func (s *monotonicSleeper) stopTimer() {
+	if !s.timer.Stop() {
+		select {
+		case <-s.timer.C:
+		default:
+		}
+	}
+}
+
+func newLogWriter(out *os.File, csvBufferSize int) *logio.Writer {
+	if out == os.Stdout {
+		return logio.NewWriter(out)
+	}
+	return logio.NewBufferedWriter(out, csvBufferSize)
 }
 
 func defaultRunID() string {

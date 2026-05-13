@@ -83,6 +83,7 @@ The client is the source of truth for traffic generation. It records when each p
 nsperf server \
   --bind 0.0.0.0 \
   --port 5201 \
+  --csv-buffer-size 100MiB \
   --out logs/run1.recv.csv
 
 nsperf client \
@@ -92,6 +93,7 @@ nsperf client \
   --duration 30s \
   --length 1200 \
   --late-tolerance 10ms \
+  --csv-buffer-size 100MiB \
   --flow-id flow-a \
   --run-id run1 \
   --out logs/run1.send.csv
@@ -111,6 +113,7 @@ Client options:
 - `--out`: send CSV path.
 - `--overrun-policy`: default `skip-missed`, skipping send slots only after generator lateness reaches one packet interval plus `--late-tolerance`; `send-late` never skips due to generator lateness.
 - `--late-tolerance`: default `10ms`, using Go duration syntax such as `100ms`, `500us`, or `0s`; applies to `--overrun-policy skip-missed`.
+- `--csv-buffer-size`: file-backed CSV buffer size, default `100MiB`; use `0` to disable the extra buffer.
 - `--quiet`: suppress progress logs.
 
 Server options:
@@ -118,6 +121,7 @@ Server options:
 - `--bind`: local bind address.
 - `--port`: local UDP port.
 - `--out`: receive CSV path.
+- `--csv-buffer-size`: file-backed CSV buffer size, default `100MiB`; use `0` to disable the extra buffer.
 - `--quiet`: suppress progress logs.
 
 ## Datagram Format
@@ -142,6 +146,8 @@ The packet header carries compact hashes for matching. The full `run_id` and `fl
 ## Log Formats
 
 Use CSV with a header row. All timestamps are nanoseconds from the local monotonic clock unless noted. Since the main simulation target is one host, send and receive monotonic timestamps can be compared for a host-local one-way delay estimate.
+
+File-backed CSV logs use a large buffer by default to reduce logging overhead during high-rate tests. The buffer is flushed when the process exits cleanly. If you need immediate writes for debugging, pass `--csv-buffer-size 0`.
 
 Send log:
 

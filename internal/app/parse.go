@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,8 @@ import (
 const (
 	OverrunSkipMissed = "skip-missed"
 	OverrunSendLate   = "send-late"
+
+	DefaultCSVBufferSize = "100MiB"
 )
 
 func ParseBitrate(s string) (uint64, error) {
@@ -81,4 +84,56 @@ func ParseDuration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("duration must be positive")
 	}
 	return d, nil
+}
+
+func ParseByteSize(s string) (int, error) {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return 0, fmt.Errorf("byte size is required")
+	}
+
+	lower := strings.ToLower(raw)
+	multiplier := float64(1)
+	for _, suffix := range []struct {
+		symbol     string
+		multiplier float64
+	}{
+		{"bytes", 1},
+		{"byte", 1},
+		{"kib", 1024},
+		{"mib", 1024 * 1024},
+		{"gib", 1024 * 1024 * 1024},
+		{"kb", 1000},
+		{"mb", 1000 * 1000},
+		{"gb", 1000 * 1000 * 1000},
+		{"b", 1},
+		{"k", 1000},
+		{"m", 1000 * 1000},
+		{"g", 1000 * 1000 * 1000},
+	} {
+		if strings.HasSuffix(lower, suffix.symbol) {
+			multiplier = suffix.multiplier
+			lower = strings.TrimSuffix(lower, suffix.symbol)
+			break
+		}
+	}
+
+	value, err := strconv.ParseFloat(strings.TrimSpace(lower), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse byte size %q: %w", s, err)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, fmt.Errorf("byte size must be non-negative")
+	}
+
+	bytes := value * multiplier
+	maxInt := int64(^uint(0) >> 1)
+	if bytes > float64(maxInt) {
+		return 0, fmt.Errorf("byte size is too large")
+	}
+	if bytes != math.Trunc(bytes) {
+		return 0, fmt.Errorf("byte size must resolve to whole bytes")
+	}
+
+	return int(bytes), nil
 }
