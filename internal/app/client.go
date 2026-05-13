@@ -25,6 +25,7 @@ type ClientConfig struct {
 	FlowID        string
 	Out           string
 	OverrunPolicy string
+	LateTolerance time.Duration
 	Quiet         bool
 }
 
@@ -40,6 +41,9 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	}
 	if cfg.Duration <= 0 {
 		return fmt.Errorf("--duration must be positive")
+	}
+	if cfg.LateTolerance < 0 {
+		return fmt.Errorf("--late-tolerance must be non-negative")
 	}
 	if cfg.Out == "" {
 		return fmt.Errorf("--out is required")
@@ -65,6 +69,7 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	lateToleranceNS := cfg.LateTolerance.Nanoseconds()
 
 	out, err := logio.Create(cfg.Out)
 	if err != nil {
@@ -109,8 +114,8 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 	flowHash := packet.HashID(cfg.FlowID)
 
 	if !cfg.Quiet {
-		_, _ = fmt.Fprintf(stderr, "client run_id=%s flow_id=%s dst=%s bitrate=%d length=%d interval_ns=%d start_mono_ns=%d\n",
-			cfg.RunID, cfg.FlowID, endpoint, bitrate, cfg.Length, intervalNS, startNS)
+		_, _ = fmt.Fprintf(stderr, "client run_id=%s flow_id=%s dst=%s bitrate=%d length=%d interval_ns=%d late_tolerance_ns=%d start_mono_ns=%d\n",
+			cfg.RunID, cfg.FlowID, endpoint, bitrate, cfg.Length, intervalNS, lateToleranceNS, startNS)
 	}
 
 	var attempted, failed, skipped uint64
@@ -124,15 +129,11 @@ func RunClient(ctx context.Context, cfg ClientConfig, stderr io.Writer) error {
 			if err != nil {
 				return err
 			}
-			if nowNS-scheduledNS < intervalNS {
+			if !shouldSkipMissedSlot(nowNS-scheduledNS, intervalNS, lateToleranceNS) {
 				break
 			}
 
-			missed := uint64((nowNS - scheduledNS) / intervalNS)
-			for range missed {
-				if scheduledNS >= endNS {
-					break
-				}
+			for scheduledNS < endNS && shouldSkipMissedSlot(nowNS-scheduledNS, intervalNS, lateToleranceNS) {
 				if err := logw.WriteSend(logio.SendRow{
 					RunID:       cfg.RunID,
 					FlowID:      cfg.FlowID,
@@ -231,6 +232,10 @@ func sendStatus(sendError string) string {
 		return logio.SendStatusSendError
 	}
 	return logio.SendStatusSent
+}
+
+func shouldSkipMissedSlot(latenessNS, intervalNS, lateToleranceNS int64) bool {
+	return latenessNS >= intervalNS+lateToleranceNS
 }
 
 func sleepUntil(ctx context.Context, targetNS int64) error {

@@ -91,6 +91,7 @@ nsperf client \
   --bitrate 10M \
   --duration 30s \
   --length 1200 \
+  --late-tolerance 10ms \
   --flow-id flow-a \
   --run-id run1 \
   --out logs/run1.send.csv
@@ -108,7 +109,8 @@ Client options:
 - `--start-mono-ns`: optional absolute monotonic start timestamp in nanoseconds.
 - `--run-id`, `--flow-id`: identifiers written to packets and logs.
 - `--out`: send CSV path.
-- `--overrun-policy`: default `skip-missed`, avoiding artificial catch-up bursts.
+- `--overrun-policy`: default `skip-missed`, skipping send slots only after generator lateness reaches one packet interval plus `--late-tolerance`; `send-late` never skips due to generator lateness.
+- `--late-tolerance`: default `10ms`, using Go duration syntax such as `100ms`, `500us`, or `0s`; applies to `--overrun-policy skip-missed`.
 - `--quiet`: suppress progress logs.
 
 Server options:
@@ -153,7 +155,7 @@ Receive log:
 schema,run_id_hash,flow_id_hash,seq,scheduled_ns,send_attempt_ns,recv_ns,bytes,remote_addr,decode_error
 ```
 
-`status` is `sent`, `send_error`, or `skipped`. `send_error` and `decode_error` are empty on success. Under the default no-catch-up policy, missed send slots are written as explicit `skipped` send-log rows with a sequence number and scheduled timestamp, but no send timestamp or byte count.
+`status` is `sent`, `send_error`, or `skipped`. `send_error` and `decode_error` are empty on success. Under the default `skip-missed` policy, send slots missed by at least one packet interval plus `--late-tolerance` are written as explicit `skipped` send-log rows with a sequence number and scheduled timestamp, but no send timestamp or byte count. Overdue packets within the tolerance window are sent late, which can create short catch-up bursts, and their generator lateness remains visible in `late_by_ns`.
 
 ## Offline Analysis
 
@@ -169,6 +171,8 @@ schema,run_id_hash,flow_id_hash,seq,scheduled_ns,send_attempt_ns,recv_ns,bytes,r
 - receive spacing error from actual receive spacing minus send-attempt spacing;
 - duplicate and reorder counts based on sequence numbers;
 - warnings when generator lateness or local send failures make network-loss conclusions unreliable.
+
+Tolerated generator lateness is excluded from the host-local latency estimate because latency is measured from the actual `send_attempt_ns`, not from the original `scheduled_ns`. Generator delay remains visible separately through `sender_timing_error`, `sender_timing_jitter_abs`, `skipped_timing_error`, and `skipped_by_generator`.
 
 The latency estimate assumes the client and server are on the same host and use the same monotonic clock domain, which is the intended network-namespace simulation setup. Across different machines, the throughput/loss/reordering results still make sense, but one-way latency numbers do not unless clocks are externally synchronized.
 

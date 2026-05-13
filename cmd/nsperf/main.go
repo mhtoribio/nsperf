@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"nsperf/internal/app"
 	"nsperf/internal/clock"
@@ -74,6 +75,7 @@ func runServer(args []string, stderr io.Writer) error {
 func runClient(args []string, stderr io.Writer) error {
 	cfg := app.ClientConfig{}
 	duration := "10s"
+	lateTolerance := "10ms"
 
 	fs := flag.NewFlagSet("nsperf client", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -87,6 +89,7 @@ func runClient(args []string, stderr io.Writer) error {
 	fs.StringVar(&cfg.FlowID, "flow-id", "flow-0", "flow identifier written to logs")
 	fs.StringVar(&cfg.Out, "out", "nsperf.send.csv", "send CSV log path")
 	fs.StringVar(&cfg.OverrunPolicy, "overrun-policy", app.OverrunSkipMissed, "overrun policy: skip-missed or send-late")
+	fs.StringVar(&lateTolerance, "late-tolerance", lateTolerance, "generator lateness tolerated by skip-missed before skipping, e.g. 10ms or 0s")
 	fs.BoolVar(&cfg.Quiet, "quiet", false, "suppress progress logs")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -103,6 +106,15 @@ func runClient(args []string, stderr io.Writer) error {
 		return fmt.Errorf("parse --duration: %w", err)
 	}
 	cfg.Duration = parsedDuration
+
+	parsedLateTolerance, err := time.ParseDuration(lateTolerance)
+	if err != nil {
+		return fmt.Errorf("parse --late-tolerance: %w", err)
+	}
+	if parsedLateTolerance < 0 {
+		return fmt.Errorf("--late-tolerance must be non-negative")
+	}
+	cfg.LateTolerance = parsedLateTolerance
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
