@@ -17,6 +17,7 @@ from typing import Any
 FNV64_OFFSET = 0xCBF29CE484222325
 FNV64_PRIME = 0x100000001B3
 NS_PER_SECOND = 1_000_000_000
+NS_PER_MILLISECOND = 1_000_000
 
 
 def hash_id(value: str) -> int:
@@ -51,6 +52,17 @@ def parse_interval_ns(value: str) -> int:
     if interval_ns <= 0:
         raise argparse.ArgumentTypeError("--interval is too small")
     return int(interval_ns)
+
+
+def parse_skip_start_ms_ns(value: str) -> int:
+    try:
+        milliseconds = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"invalid skip duration {value!r}") from exc
+    if milliseconds < 0:
+        raise argparse.ArgumentTypeError("--skip-start-ms must be non-negative")
+
+    return int((milliseconds * NS_PER_MILLISECOND).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def send_status(row: dict[str, str]) -> str:
@@ -155,6 +167,55 @@ def send_window_timestamp(row: dict[str, str]) -> int:
     if row.get("send_attempt_ns"):
         return int_field(row, "send_attempt_ns")
     return int_field(row, "scheduled_ns")
+
+
+def start_skip_metadata(skip_start_ns: int) -> dict[str, Any]:
+    return {
+        "skip_start_ms": skip_start_ns / NS_PER_MILLISECOND,
+        "skip_start_ns": skip_start_ns,
+        "skip_cutoff_ns": None,
+        "skipped_send_rows": 0,
+        "skipped_recv_rows": 0,
+    }
+
+
+def apply_start_skip(
+    send_rows: list[dict[str, str]],
+    valid_recv: list[dict[str, str]],
+    decode_error_rows: list[dict[str, str]],
+    skip_start_ns: int,
+) -> tuple[
+    list[dict[str, str]],
+    list[dict[str, str]],
+    list[dict[str, str]],
+    dict[str, Any],
+]:
+    metadata = start_skip_metadata(skip_start_ns)
+    if skip_start_ns == 0 or not send_rows:
+        return send_rows, valid_recv, decode_error_rows, metadata
+
+    first_send_ns = min(send_window_timestamp(row) for row in send_rows)
+    cutoff_ns = first_send_ns + skip_start_ns
+    filtered_send = [row for row in send_rows if send_window_timestamp(row) >= cutoff_ns]
+    filtered_valid_recv = [row for row in valid_recv if receive_skip_timestamp(row) >= cutoff_ns]
+    filtered_decode_errors = [row for row in decode_error_rows if receive_skip_timestamp(row) >= cutoff_ns]
+    skipped_recv_rows = (
+        len(valid_recv)
+        + len(decode_error_rows)
+        - len(filtered_valid_recv)
+        - len(filtered_decode_errors)
+    )
+
+    metadata["skip_cutoff_ns"] = cutoff_ns
+    metadata["skipped_send_rows"] = len(send_rows) - len(filtered_send)
+    metadata["skipped_recv_rows"] = skipped_recv_rows
+    return filtered_send, filtered_valid_recv, filtered_decode_errors, metadata
+
+
+def receive_skip_timestamp(row: dict[str, str]) -> int:
+    if row.get("send_attempt_ns"):
+        return int_field(row, "send_attempt_ns")
+    return int_field(row, "recv_ns")
 
 
 def reorder_count(rows: list[dict[str, str]]) -> int:
@@ -335,6 +396,7 @@ def receive_reorder_counts_by_window(
 def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
     send_rows = read_rows(args.send)
     recv_rows = read_rows(args.recv)
+    skip_start_ns = getattr(args, "skip_start_ns", 0) or 0
     run_id, flow_id = infer_ids(send_rows, args.run_id, args.flow_id)
 
     if run_id is not None:
@@ -352,6 +414,11 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
         valid_recv = [row for row in valid_recv if int_field(row, "run_id_hash", -1) == run_hash]
     if flow_hash is not None:
         valid_recv = [row for row in valid_recv if int_field(row, "flow_id_hash", -1) == flow_hash]
+
+    send_rows, valid_recv, decode_error_rows, skip = apply_start_skip(
+        send_rows, valid_recv, decode_error_rows, skip_start_ns
+    )
+    decode_errors = len(decode_error_rows)
 
     skipped_rows = [row for row in send_rows if send_status(row) == "skipped"]
     attempt_rows = [row for row in send_rows if send_status(row) != "skipped"]
@@ -424,6 +491,11 @@ def analyze_data(args: argparse.Namespace) -> dict[str, Any]:
         "schema": "nsperf-analysis-v1",
         "run_id": run_id,
         "flow_id": flow_id,
+        "skip_start_ms": skip["skip_start_ms"],
+        "skip_start_ns": skip["skip_start_ns"],
+        "skip_cutoff_ns": skip["skip_cutoff_ns"],
+        "skipped_send_rows": skip["skipped_send_rows"],
+        "skipped_recv_rows": skip["skipped_recv_rows"],
         "counts": {
             "scheduled_packets_logged": len(send_rows),
             "send_attempts": len(attempt_rows),
@@ -480,6 +552,14 @@ def print_text(result: dict[str, Any]) -> None:
 
     print(f"run_id: {result['run_id'] or 'n/a'}")
     print(f"flow_id: {result['flow_id'] or 'n/a'}")
+    if result["skip_start_ns"]:
+        cutoff = result["skip_cutoff_ns"] if result["skip_cutoff_ns"] is not None else "n/a"
+        print(
+            f"skip_start: {result['skip_start_ms']:.3f} ms "
+            f"cutoff_ns={cutoff} "
+            f"skipped_send_rows={result['skipped_send_rows']} "
+            f"skipped_recv_rows={result['skipped_recv_rows']}"
+        )
     print(f"scheduled_packets_logged: {counts['scheduled_packets_logged']}")
     print(f"send_attempts: {counts['send_attempts']}")
     print(f"local_send_failures: {counts['local_send_failures']}")
@@ -569,7 +649,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--recv", type=Path, required=True, help="server receive CSV")
     parser.add_argument("--run-id", help="run identifier to analyze; inferred from send log by default")
     parser.add_argument("--flow-id", help="flow identifier to analyze; inferred from send log by default")
-    parser.add_argument("--interval", type=parse_interval_ns, dest="interval_ns", metavar="SECONDS", help="emit interval reports using fixed-width windows")
+    parser.add_argument(
+        "--interval",
+        type=parse_interval_ns,
+        dest="interval_ns",
+        metavar="SECONDS",
+        help="emit interval reports using fixed-width windows",
+    )
+    parser.add_argument(
+        "--skip-start-ms",
+        type=parse_skip_start_ms_ns,
+        dest="skip_start_ns",
+        metavar="MS",
+        default=0,
+        help="discard the first MS milliseconds from the selected stream before analysis",
+    )
     parser.add_argument("--format", dest="output_format", choices=("text", "json"), default="text", help="output format")
     parser.add_argument("--json", action="store_const", const="json", dest="output_format", help="shortcut for --format json")
     return analyze(parser.parse_args(argv))

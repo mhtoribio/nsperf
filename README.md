@@ -190,6 +190,12 @@ python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --j
 
 JSON output uses numeric nanosecond fields for timing stats and numeric `*_bps` fields for rates. Missing metrics are `null`.
 
+Use `--skip-start-ms MS` to discard warmup traffic from the selected run/flow before computing loss, rates, timing, or intervals. The duration is measured from the first sender-side timestamp in that run/flow:
+
+```sh
+python3 tools/analyze.py --send logs/run1.send.csv --recv logs/run1.recv.csv --skip-start-ms 200
+```
+
 Use `--interval SECONDS` for fixed-width interval reports. Common values are `1` for one-second reporting, `0.5` for 500 ms reporting, or `5` for a coarser five-second view:
 
 ```sh
